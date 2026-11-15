@@ -1,1057 +1,998 @@
--- @author gera289
--- @uid 1
+-- @author 0x
+-- @uid 0
 
-local VibeUI = {}
-VibeUI.__index = VibeUI
-VibeUI.__version = "2.0-library"
+-- ============================================================================
+--  0x resolver  ·  v2.1
+--  Neverlose CS2 Lua  ·  API: github.com/PbLJk/neverlose-lua-api
+--
+--  Layered yaw/pitch resolver:
+--    1. per-netupdate yaw history  -> AA classification (static / jitter / spin / random)
+--    2. body-yaw hint              -> model geometry from hitboxes (legs / shoulders)
+--    3. freestanding hint          -> cover traces around the enemy head
+--    4. movement memory            -> last movement yaw after the enemy stops
+--    5. shot feedback              -> weapon_fire + player_hurt => hit / miss learning
+--    6. brute-force cycling        -> deterministic multiplier table, locked on hit
+--    7. persistence                -> learned side per SteamID (db.*)
+--
+--  Memory override (m_angEyeAngles) requires "Allow Insecure". Without it the
+--  script runs in tracking-only mode (overlay + stats still work).
+-- ============================================================================
 
--- ============================================================
---  HELPERS
--- ============================================================
-local function safe(fn, ...)
-    local ok, a, b, c, d = pcall(fn, ...)
-    if ok then return a, b, c, d end
-end
-local function clamp255(v) return math.floor(math.max(0, math.min(255, v))) end
-local function white(a) return color(255, 255, 255, clamp255(a)) end
-local function black(a) return color(0, 0, 0, clamp255(a)) end
-local function in_rect(mx, my, x, y, w, h)
-    return mx >= x and mx <= x + w and my >= y and my <= y + h
-end
-local function lerp(a, b, t) return a + (b - a) * t end
-
--- ============================================================
---  THEME
--- ============================================================
-local THEME = {
-    bg       = color(13, 14, 21, 244),
-    border   = color(255, 255, 255, 16),
-    card     = color(20, 21, 31, 255),
-    sep      = color(255, 255, 255, 10),
-    field    = color(12, 13, 19, 255),
-    label    = color(206, 209, 222, 255),
-    section  = color(96, 99, 118, 255),
-    value    = color(190, 193, 208, 255),
-    sw_off   = color(50, 52, 64, 255),
-    knob_off = color(138, 142, 158, 255),
-    knob     = color(255, 255, 255, 255),
-    accent   = color(140, 148, 255, 255),
-    row_h    = 36,
-    header_h = 56,
-    font_sz  = 13,
+local META = {
+    name    = "0x resolver",
+    version = "2.1",
+    db      = "0x_resolver_v21",
 }
 
-VibeUI.accent_override = nil
-function VibeUI.set_accent(c) VibeUI.accent_override = c end
-local function refresh_accent()
-    if VibeUI.accent_override then THEME.accent = VibeUI.accent_override; return end
-    local c = safe(render.theme, "accent")
-    if type(c) == "table" and c.r ~= nil then THEME.accent = color(c.r, c.g, c.b, 255) end
+-- ----------------------------------------------------------------------------
+-- Locals / fast paths
+-- ----------------------------------------------------------------------------
+local floor, abs, sqrt, atan2, sin, cos, rad, deg = math.floor, math.abs, math.sqrt, math.atan2, math.sin, math.cos, math.rad, math.deg
+local max, min = math.max, math.min
+local normalize, clamp = math.normalize_angle, math.clamp
+local calc_angle = math.calc_angle
+local pcall, ipairs, pairs, type, tostring, format = pcall, ipairs, pairs, type, tostring, string.format
+local tremove = table.remove
+
+local function safe(fn, ...)
+    local ok, r = pcall(fn, ...)
+    if ok then return r end
+    return nil
 end
 
--- ============================================================
---  FONT
--- ============================================================
-local FONT = nil
-for _, name in ipairs({ "Segoe UI", "Tahoma", "Roboto" }) do
-    local f = safe(render.font, name, THEME.font_sz)
-    if f and safe(function() return f:loaded() end) then FONT = f; break end
-end
-local function text(x, y, col, str, size)
-    render.text(x, y, col, str, "", size or THEME.font_sz, FONT)
-end
-local function tsize(str, size)
-    return render.text_size(str, "", size or THEME.font_sz, FONT)
-end
-local TH = nil
-local function text_h()
-    if not TH then local _, h = tsize("Ag"); TH = h or THEME.font_sz end
-    return TH
-end
-local function row_text(x, ry, label)
-    text(x + 14, ry + (THEME.row_h - text_h()) / 2, THEME.label, label)
-end
-
--- ============================================================
---  WIDGET HANDLE
--- ============================================================
-local Widget = {}
-Widget.__index = Widget
-
-function Widget:get() return self.value end
-function Widget:set(v)
-    self.value = v
-    if self.type == "colorpicker" and v and v.hsv then
-        local h, s, vv = v:hsv()
-        self._h, self._s, self._v = h, s, vv
-        self._a = v.a / 255
-    end
-    if self.on_change then pcall(self.on_change, v) end
-    return self
-end
-function Widget:on_change(fn) self.on_change = fn; return self end
-
--- ============================================================
---  SECTION
--- ============================================================
-local Section = {}
-Section.__index = Section
-function Section.new(title)
-    return setmetatable({ title = title, widgets = {} }, Section)
-end
-function Section:add(w)
-    table.insert(self.widgets, w)
-    return w
-end
-
--- ============================================================
---  TAB
--- ============================================================
-local Tab = {}
-Tab.__index = Tab
-
-function Tab.new(menu, name)
-    local t = setmetatable({
-        menu = menu,
-        name = name,
-        sections = {},
-        widget_map = {},
-    }, Tab)
-    t:section("")
-    return t
-end
-
-function Tab:section(title)
-    local s = Section.new(title or "")
-    table.insert(self.sections, s)
-    self._current = s
-    return s
-end
-
-local function reg(tab, w)
-    tab.widget_map[w.id] = w
-    tab._current:add(w)
-    return w
-end
-
-function Tab:checkbox(id, label, default, cb)
-    return reg(self, setmetatable({
-        type = "checkbox", id = id, label = label,
-        value = default or false, on_change = cb,
-        anim = default and 1 or 0,
-    }, Widget))
-end
-
-function Tab:slider(id, label, default, lo, hi, step, fmt, cb)
-    return reg(self, setmetatable({
-        type = "slider", id = id, label = label,
-        value = default or lo, lo = lo, hi = hi, step = step or 1,
-        fmt = fmt or function(v) return tostring(math.floor(v + 0.5)) end,
-        on_change = cb,
-    }, Widget))
-end
-
-function Tab:combo(id, label, items, default_idx, cb)
-    return reg(self, setmetatable({
-        type = "combo", id = id, label = label,
-        items = items, value = default_idx or 1,
-        on_change = cb, hover_t = 0, arrow_t = 0,
-    }, Widget))
-end
-
-function Tab:colorpicker(id, label, default, cb)
-    local c = default or THEME.accent
-    local h, s, v = c:hsv()
-    return reg(self, setmetatable({
-        type = "colorpicker", id = id, label = label,
-        value = c, on_change = cb,
-        _h = h, _s = s, _v = v, _a = c.a / 255,
-    }, Widget))
-end
-
-function Tab:button(id, label, cb)
-    return reg(self, setmetatable({
-        type = "button", id = id, label = label,
-        on_click = cb, hover_t = 0,
-    }, Widget))
-end
-
-function Tab:label(txt)
-    return reg(self, setmetatable({
-        type = "label", id = "__lbl_" .. tostring(#self._current.widgets),
-        label = txt,
-    }, Widget))
-end
-
-function Tab:get(id) local w = self.widget_map[id]; return w and w:get() end
-function Tab:set(id, v) local w = self.widget_map[id]; if w then w:set(v) end end
-function Tab:find(id) return self.widget_map[id] end
-
--- ============================================================
---  MENU INSTANCE
--- ============================================================
-local SPRING_STIFFNESS = 350
-local SPRING_DAMPING   = 30
-local DOCK_GAP = 8
-local MIN_H = 480
-
-local REGISTERED = {}
-local mouse_prev_global = false
-
-function VibeUI.new(opts)
-    opts = opts or {}
-    return setmetatable({
-        title      = opts.title or "Menu",
-        subtitle   = opts.subtitle or ("VibeUI " .. VibeUI.__version),
-        opts_width = opts.width or 350,
-        opts_height= opts.height or MIN_H,
-        follow_ui  = opts.follow_ui ~= false,
-        position   = opts.position or { x = 200, y = 200 },
-        draggable  = opts.draggable ~= false,
-        visible    = true,
-
-        tabs = {},
-        current_tab_idx = 1,
-        prev_tab_idx = 1,
-
-        -- dock
-        dock_anim = 0,
-        dock_edge = 0,
-
-        -- layout / scroll
-        x = 0, y = 0, w = 0, h = 0,
-        scroll_y = 0,
-        content_h = 0,
-
-        -- tab indicator spring
-        tab_y = nil,
-        tab_vel_y = 0,
-
-        -- content transition spring
-        tab_spring = 1,
-        tab_spring_vel = 0,
-        anim_dir = 1,
-
-        -- interaction
-        slider_active = nil,
-        sb_drag = false,
-        ds_drag = false, ds_y0 = 0, ds_s0 = 0,
-        click_used = false,
-        drag_win = false, drag_off_x = 0, drag_off_y = 0,
-
-        -- dropdown (per-instance)
-        dd = { open_id = nil, items = {}, setter = nil, selected_idx = 0,
-               x = 0, y = 0, w = 0, anim = 0, scroll = 0, item_h = 26, max_h = 150 },
-
-        -- colorpicker (per-instance)
-        cp = { open = false, target = nil, h = 0, s = 1, v = 1, a = 1,
-               drag = nil, skip_close = false, anim = 0,
-               fmt = 0, dd_open = false, dd_anim = 0 },
-
-        mouse_prev = false,
-        _registered = false,
-    }, VibeUI)
-end
-
-function VibeUI:tab(name)
-    local t = Tab.new(self, name)
-    table.insert(self.tabs, t)
-    return t
-end
-function VibeUI:get_tab(name)
-    for _, t in ipairs(self.tabs) do
-        if t.name == name then return t end
-    end
-end
-
-function VibeUI:show() self.visible = true end
-function VibeUI:hide() self.visible = false end
-function VibeUI:set_position(x, y) self.position.x = x; self.position.y = y end
-
-function VibeUI:register()
-    if not self._registered then
-        self._registered = true
-        table.insert(REGISTERED, self)
-    end
-    return self
-end
-function VibeUI:unregister()
-    for i, m in ipairs(REGISTERED) do
-        if m == self then table.remove(REGISTERED, i); break end
-    end
-    self._registered = false
-end
-
-function VibeUI:is_visible()
-    if not self.visible then return false end
-    if self.follow_ui then return input.menu_open() == true end
-    return true
-end
-
-function VibeUI:_blocked()
-    return self.cp.open or self.dd.open_id ~= nil
-end
-
--- ============================================================
---  POSITIONING
--- ============================================================
-function VibeUI:_update_geometry()
-    if self.follow_ui then
-        local mp = safe(function() return ui.position() end)
-        local ms = safe(function() return ui.size() end)
-        if not (mp and ms and mp.x and ms.x and ms.x > 0) then
-            local sw, sh = render.screen_size()
-            self.w = self.opts_width
-            self.h = math.max(self.opts_height, MIN_H)
-            self.x = sw - self.w - 40
-            self.y = (sh - self.h) / 2
-            return false
-        end
-        self.w = self.opts_width
-        self.h = math.max(ms.y, self.opts_height or MIN_H)
-        self.dock_edge = mp.x + ms.x
-        self.x = self.dock_edge + DOCK_GAP - (1 - self.dock_anim) * (self.w + DOCK_GAP)
-        self.y = mp.y
-        return true
-    else
-        self.w = self.opts_width
-        self.h = self.opts_height
-        self.x = self.position.x
-        self.y = self.position.y
-        return true
-    end
-end
-
--- ============================================================
---  SPRING UPDATERS
--- ============================================================
-function VibeUI:_update_tab_spring(dt)
-    if math.abs(self.tab_spring - 1) < 0.001 and math.abs(self.tab_spring_vel) < 0.001 then
-        self.tab_spring = 1
-        self.tab_spring_vel = 0
-        return
-    end
-    local step = math.min(dt, 0.033)
-    local force = SPRING_STIFFNESS * (1 - self.tab_spring) - SPRING_DAMPING * self.tab_spring_vel
-    self.tab_spring_vel = self.tab_spring_vel + force * step
-    self.tab_spring = self.tab_spring + self.tab_spring_vel * step
-    if self.tab_spring > 1.15 then self.tab_spring = 1.15; self.tab_spring_vel = 0 end
-    if self.tab_spring < -0.15 then self.tab_spring = -0.15; self.tab_spring_vel = 0 end
-end
-
-function VibeUI:_tab_anim_done()
-    return math.abs(self.tab_spring - 1) < 0.02 and math.abs(self.tab_spring_vel) < 0.02
-end
-
--- ============================================================
---  WIDGET DRAWERS
---  All receive (self, w, ui, x, ry, width, interactive)
--- ============================================================
-function VibeUI:_draw_checkbox(w, ui, x, ry, width, interactive)
-    row_text(x, ry, w.label)
-    local on = w.value and 1 or 0
-    w.anim = w.anim + (on - w.anim) * math.min(1, globals.frametime() * 16)
-    if math.abs(w.anim - on) < 0.005 then w.anim = on end
-    local t = w.anim
-    local sw, sh = 34, 18
-    local sx, sy = x + width - 14 - sw, ry + (THEME.row_h - sh) / 2
-    render.rect_filled(sx, sy, sw, sh, THEME.sw_off:lerp(THEME.accent, t), sh / 2)
-    render.circle_filled(sx + 9 + (sw - 18) * t, sy + sh / 2, 6,
-        THEME.knob_off:lerp(THEME.knob, t), 24)
-    if interactive and not self:_blocked() and ui.clicked
-        and in_rect(ui.mx, ui.my, x, ry, width, THEME.row_h) then
-        self.click_used = true
-        w:set(not w.value)
-    end
-end
-
-function VibeUI:_draw_slider(w, ui, x, ry, width, interactive)
-    row_text(x, ry, w.label)
-    local f = math.max(0, math.min(1, (w.value - w.lo) / (w.hi - w.lo)))
-
-    local bw, bh = 56, 22
-    local bx, by = x + width - 14 - bw, ry + (THEME.row_h - bh) / 2
-    render.rect_filled(bx, by, bw, bh, THEME.field, 6)
-    render.rect(bx, by, bw, bh, THEME.border, 6, 1)
-    local vs = w.fmt(w.value)
-    local vw, vh = tsize(vs)
-    text(bx + (bw - vw) / 2, by + (bh - vh) / 2, THEME.value, vs)
-
-    local tw = 92
-    local tx = bx - 12 - tw
-    local ty = ry + THEME.row_h / 2
-    render.rect_filled(tx, ty - 2, tw, 4, THEME.sw_off, 2)
-    if f > 0 then render.rect_filled(tx, ty - 2, tw * f, 4, THEME.accent, 2) end
-    render.circle_filled(tx + tw * f, ty, 6, THEME.knob, 20)
-
-    if interactive and not self:_blocked() then
-        local on_track = in_rect(ui.mx, ui.my, tx - 8, ty - 10, tw + 16, 20)
-        if ui.clicked and on_track then self.click_used = true end
-        if ui.down and (self.slider_active == w.id or (ui.clicked and on_track)) then
-            self.slider_active = w.id
-            local nf = math.max(0, math.min(1, (ui.mx - tx) / tw))
-            local v = w.lo + nf * (w.hi - w.lo)
-            v = math.floor(v / w.step + 0.5) * w.step
-            v = math.max(w.lo, math.min(w.hi, v))
-            if v ~= w.value then w:set(v) end
-        end
-        if ui.released and self.slider_active == w.id then self.slider_active = nil end
-    end
-end
-
-function VibeUI:_draw_combo(w, ui, x, ry, width, interactive)
-    row_text(x, ry, w.label)
-    local bw, bh = 134, 24
-    local bx, by = x + width - 14 - bw, ry + (THEME.row_h - bh) / 2
-    local idx = w.value
-
-    local hover = interactive and not self:_blocked() and in_rect(ui.mx, ui.my, bx, by, bw, bh)
-    w.hover_t = w.hover_t + ((hover and 1 or 0) - w.hover_t) * math.min(1, globals.frametime() * 16)
-    local t = w.hover_t
-    render.rect_filled(bx, by, bw, bh, THEME.field:lerp(color(28, 30, 46, 255), t), 6)
-    render.rect(bx, by, bw, bh, THEME.border:lerp(THEME.accent:alpha(80), t), 6, 1)
-
-    local cur = w.items[idx] or "?"
-    local _, ch = tsize(cur)
-    text(bx + 10, by + (bh - ch) / 2, THEME.label, cur)
-
-    local is_open = (self.dd.open_id == w.id)
-    w.arrow_t = w.arrow_t + ((is_open and 1 or 0) - w.arrow_t) * math.min(1, globals.frametime() * 16)
-    local ccx, ccy = bx + bw - 14, by + bh / 2
-    local d = 1 - 2 * w.arrow_t
-    render.line(ccx - 4, ccy - 2 * d, ccx, ccy + 2 * d, THEME.value, 1.5)
-    render.line(ccx, ccy + 2 * d, ccx + 4, ccy - 2 * d, THEME.value, 1.5)
-
-    if interactive and not self.cp.open and ui.clicked
-        and in_rect(ui.mx, ui.my, bx, by, bw, bh) then
-        self.click_used = true
-        if is_open then
-            self.dd.open_id = nil
-        else
-            self.dd.open_id = w.id
-            self.dd.items = w.items
-            self.dd.setter = function(i) w:set(i) end
-            self.dd.selected_idx = idx - 1
-            self.dd.x = bx
-            self.dd.y = by + bh + 2
-            self.dd.w = bw
-            self.dd.anim = 0
-            self.dd.scroll = 0
-            local _, sh = render.screen_size()
-            local th = math.min(#w.items * self.dd.item_h, self.dd.max_h)
-            if self.dd.y + th > sh then self.dd.y = by - th - 2 end
-        end
-    end
-end
-
-function VibeUI:_draw_colorpicker_btn(w, ui, x, ry, width, interactive)
-    row_text(x, ry, w.label)
-    local sw, sh = 34, 18
-    local sx, sy = x + width - 14 - sw, ry + (THEME.row_h - sh) / 2
-    local col = w.value
-    render.rect_filled(sx, sy, sw, sh, THEME.sw_off, 6)
-    render.rect_filled(sx, sy, sw, sh, col, 6)
-    render.rect(sx, sy, sw, sh, white(40), 6, 1)
-    if interactive and not self.cp.open and not self.dd.open_id and ui.clicked
-        and in_rect(ui.mx, ui.my, sx - 4, sy - 4, sw + 8, sh + 8) then
-        self.click_used = true
-        local h, s, v = col:hsv()
-        self.cp.h, self.cp.s, self.cp.v = h, s, v
-        self.cp.a = col.a / 255
-        self.cp.target = w
-        self.cp.open = true
-        self.cp.skip_close = true
-    end
-end
-
-function VibeUI:_draw_button(w, ui, x, ry, width, interactive)
-    local bx, by, bw, bh = x + 14, ry + 6, width - 28, THEME.row_h - 12
-    local hover = interactive and not self:_blocked() and in_rect(ui.mx, ui.my, bx, by, bw, bh)
-    w.hover_t = w.hover_t + ((hover and 1 or 0) - w.hover_t) * math.min(1, globals.frametime() * 16)
-    local t = w.hover_t
-    render.rect_filled(bx, by, bw, bh, THEME.field:lerp(color(30, 32, 48, 255), t), 7)
-    render.rect(bx, by, bw, bh, THEME.border:lerp(THEME.accent, t), 7, 1)
-    local tw, th = tsize(w.label)
-    text(bx + (bw - tw) / 2, by + (bh - th) / 2, THEME.label, w.label)
-    if hover and ui.clicked then
-        self.click_used = true
-        if w.on_click then pcall(w.on_click) end
-    end
-end
-
-function VibeUI:_draw_label(w, ui, x, ry, width)
-    row_text(x, ry, w.label)
-end
-
-function VibeUI:_draw_widget(w, ui, x, ry, width, interactive)
-    if w.type == "checkbox" then self:_draw_checkbox(w, ui, x, ry, width, interactive)
-    elseif w.type == "slider" then self:_draw_slider(w, ui, x, ry, width, interactive)
-    elseif w.type == "combo" then self:_draw_combo(w, ui, x, ry, width, interactive)
-    elseif w.type == "colorpicker" then self:_draw_colorpicker_btn(w, ui, x, ry, width, interactive)
-    elseif w.type == "button" then self:_draw_button(w, ui, x, ry, width, interactive)
-    elseif w.type == "label" then self:_draw_label(w, ui, x, ry, width)
-    end
-end
-
--- ============================================================
---  TAB CONTENT RENDER
--- ============================================================
-function VibeUI:_draw_tab_content(tab, ui, gx, start_y, gw, interactive)
-    local cy = start_y
-    for _, section in ipairs(tab.sections) do
-        if section.title ~= "" then
-            text(gx + 4, cy, THEME.section, section.title)
-            cy = cy + 20
-        end
-        if #section.widgets > 0 then
-            local ch = #section.widgets * THEME.row_h
-            render.rect_filled(gx, cy, gw, ch, THEME.card, 10)
-            render.rect(gx, cy, gw, ch, THEME.border, 10, 1)
-            for i = 1, #section.widgets - 1 do
-                render.rect_filled(gx + 12, cy + i * THEME.row_h, gw - 24, 1, THEME.sep)
-            end
-            for i, w in ipairs(section.widgets) do
-                self:_draw_widget(w, ui, gx, cy + (i - 1) * THEME.row_h, gw, interactive)
-            end
-            cy = cy + ch + 14
-        else
-            cy = cy + 10
-        end
-    end
-    return cy
-end
-
--- ============================================================
---  SIDE TABS
--- ============================================================
-function VibeUI:_draw_tabs(ui, x, y)
-    local tab = self.tabs[self.current_tab_idx]
-    if not tab then return end
-
-    local bh, tab_w, gap = 36, 54, 8
-    local tx = x
-    local ty = y + 16
-    local target_y = ty + (self.current_tab_idx - 1) * (bh + gap)
-    if self.tab_y == nil then self.tab_y = target_y end
-
-    local dt = globals.frametime()
-    local stiffness, damping = 300, 22
-    local force = stiffness * (target_y - self.tab_y) - damping * self.tab_vel_y
-    self.tab_vel_y = self.tab_vel_y + force * dt
-    self.tab_y = self.tab_y + self.tab_vel_y * dt
-    if math.abs(self.tab_vel_y) < 0.1 and math.abs(self.tab_y - target_y) < 0.1 then
-        self.tab_y = target_y
-        self.tab_vel_y = 0
-    end
-
-    local stretch = math.min(math.abs(self.tab_vel_y) * 0.06, 24)
-    local cur_h = bh + stretch
-    local cur_y = self.tab_y - stretch / 2
-    local min_y = ty - 8
-    local max_y = ty + (#self.tabs * bh + (#self.tabs - 1) * gap) - cur_h + 8
-    cur_y = math.max(min_y, math.min(cur_y, max_y))
-
-    for i = 1, #self.tabs do
-        local sy = ty + (i - 1) * (bh + gap)
-        render.rect_filled(tx, sy, tab_w, bh, THEME.card, 10)
-        render.rect(tx, sy, tab_w, bh, THEME.border, 10, 1)
-    end
-
-    render.shadow(tx, cur_y, tab_w, cur_h, THEME.accent:alpha(60), 8, 4)
-    render.rect_filled(tx, cur_y, tab_w, cur_h, color(255, 255, 255, 10), 10)
-    render.rect(tx, cur_y, tab_w, cur_h, THEME.accent, 10, 1.5)
-
-    for i = 1, #self.tabs do
-        local sy = ty + (i - 1) * (bh + gap)
-        local is_active = (self.current_tab_idx == i)
-        local cx = tx + tab_w / 2
-        local cy = sy + bh / 2
-        local ic = is_active and THEME.knob or THEME.section
-
-        if i == 1 then
-            render.rect(cx - 7, cy - 6, 14, 10, ic, 2, 1.5)
-            render.rect_filled(cx - 2, cy + 4, 4, 2, ic, 1)
-        else
-            local lw = 12
-            render.line(cx - lw/2, cy - 4, cx + lw/2, cy - 4, ic, 1.5)
-            render.circle_filled(cx - 2, cy - 4, 2.5, THEME.card, 12)
-            render.circle(cx - 2, cy - 4, 2.5, ic, 12, 1.5)
-            render.line(cx - lw/2, cy + 4, cx + lw/2, cy + 4, ic, 1.5)
-            render.circle_filled(cx + 2, cy + 4, 2.5, THEME.card, 12)
-            render.circle(cx + 2, cy + 4, 2.5, ic, 12, 1.5)
-        end
-
-        if not self:_blocked() and ui.clicked and self.current_tab_idx ~= i
-            and in_rect(ui.mx, ui.my, tx, sy, tab_w, bh) then
-            self.click_used = true
-            self.prev_tab_idx = self.current_tab_idx
-            self.current_tab_idx = i
-            self.scroll_y = 0
-            self.tab_spring = 0
-            self.tab_spring_vel = 0
-            self.anim_dir = (self.current_tab_idx > self.prev_tab_idx) and 1 or -1
-            self.tab_vel_y = (target_y - self.tab_y) * 0.5
-            self.dd.open_id = nil
-        end
-    end
-end
-
--- ============================================================
---  HEADER
--- ============================================================
-function VibeUI:_draw_header(x, y, w)
-    local lx, ly, ls = x + 16, y + 11, 34
-    render.rect_filled(lx, ly, ls, ls, color(22, 23, 34, 255), 9)
-    render.rect(lx, ly, ls, ls, THEME.border, 9, 1)
-    text(lx + ls + 12, y + 12, THEME.knob, self.title, 15)
-    text(lx + ls + 12, y + 31, THEME.section, self.subtitle, 11)
-    render.rect_filled(x + 16, y, w - 32, 1, THEME.sep)
-end
-
--- ============================================================
---  MAIN CONTENT (scroll + tab spring transition)
--- ============================================================
-local function get_wheel()
-    if safe(input.key_down, 0x0E) then return -1 end
-    if safe(input.key_down, 0x0F) then return  1 end
+local function sign(v)
+    if v > 0 then return 1 elseif v < 0 then return -1 end
     return 0
 end
 
-function VibeUI:_draw_controls(ui, x, y, w)
-    local gx, gw = x + 14, w - 28
-    local vp_y = y + 16
-    local vp_h = (y + self.h) - vp_y - THEME.header_h - 8
-    local max_scroll = math.max(0, self.content_h - vp_h)
-    self.click_used = false
+-- ----------------------------------------------------------------------------
+-- Constants
+-- ----------------------------------------------------------------------------
+local C = {
+    HISTORY          = 12,     -- yaw samples kept per player (~190 ms @ 64 tick)
+    JITTER_MIN_DELTA = 12,     -- deg; a delta counts as "big" above this
+    SPIN_MIN_RATE    = 20,     -- deg/update mean signed drift to classify as spin
+    STATIC_MAX_DELTA = 3,      -- deg mean |delta| below this = static
+    RANDOM_CENTER_AT = 25,     -- deg mean |delta| above this -> use circular mean as base
+    MOVE_SPEED       = 4,      -- u/s 2D; above = moving
+    MOVE_MEM_TIME    = 1.0,    -- s; movement memory validity after stopping
+    BODY_MAX_DELTA   = 35,     -- deg; body hint saturates here
+    BODY_MIN_DELTA   = 8,      -- deg; below = no hint
+    BODY_SANE_DELTA  = 110,    -- deg; model yaw further than this from eye yaw = invalid sample
+    FS_OFFSET        = 26,     -- u; lateral offset for freestanding traces
+    PURGE_AFTER      = 90,     -- s; drop records not seen for this long
+    PENDING_MAX      = 32,     -- max outstanding shots
+    DB_MAX           = 64,     -- persisted players
+    W_LEARNED        = 1.00,
+    W_BODY           = 0.55,
+    W_FREESTAND      = 0.40,
+    W_MOVE           = 0.30,
+    SIDE_DEADZONE    = 0.15,
+    HIT_CONF_GAIN    = 0.30,
+    MISS_CONF_LOSS   = 0.20,
+    ROUND_CONF_DECAY = 0.85,
+}
 
-    if not self:_blocked() and in_rect(ui.mx, ui.my, x, y, w, self.h) then
-        local wh = get_wheel()
-        if wh ~= 0 then self.scroll_y = self.scroll_y - wh * 40 end
+-- Brute multipliers applied to (side * desync). Index 1 is the "trusted" prediction.
+local BRUTE = { 1.0, -1.0, 0.5, -0.5, 0.0, 0.75, -0.75 }
+local BRUTE_N = #BRUTE
+
+local MODE_ADAPTIVE, MODE_STATIC, MODE_BRUTE = 1, 2, 3
+local BASE_AUTO, BASE_EYE, BASE_TARGET = 1, 2, 3
+local PITCH_OFF, PITCH_CLAMP, PITCH_AUTO = 1, 2, 3
+
+local STAGE_LAGCOMP = (stage and stage.lagcomp) or 6
+local STAGE_NET_END = (stage and stage.net_update_end) or 7
+local MASK_VISIBLE  = (trace and trace.mask and trace.mask.visible) or 1847299
+
+local EYE_CLASSES = { "C_CSPlayerPawn", "C_CSPlayerPawnBase", "CCSPlayerPawn" }
+
+local MODE_LABEL = { static = "STATIC", jitter = "JITTER", spin = "SPIN", random = "RANDOM" }
+
+-- ----------------------------------------------------------------------------
+-- UI
+-- ----------------------------------------------------------------------------
+local UI = {}
+local COMBO_BASE = nil -- 0 or 1, detected at runtime
+
+-- Creates a combo with a 1-based default and records whether :get() is 0- or 1-based.
+local function make_combo(group, name, items, default1)
+    local ctrl = group:combo(name, items)
+    local v = ctrl:get()
+    if COMBO_BASE == nil and type(v) == "number" then
+        COMBO_BASE = (v == 0) and 0 or 1
     end
-
-    if self.ds_drag then
-        if ui.down and not self:_blocked() then self.scroll_y = self.ds_s0 - (ui.my - self.ds_y0)
-        else self.ds_drag = false end
-    end
-
-    local thumb_h = (max_scroll > 0) and math.max(28, vp_h * vp_h / self.content_h) or 0
-    if max_scroll > 0 and not self:_blocked() then
-        if ui.clicked and in_rect(ui.mx, ui.my, x + w - 20, vp_y, 20, vp_h) then
-            self.sb_drag = true
+    if default1 and default1 > 1 then
+        if type(v) == "number" then
+            safe(ctrl.set, ctrl, (COMBO_BASE or 0) + default1 - 1)
+        else
+            safe(ctrl.set, ctrl, items[default1])
         end
-        if self.sb_drag then
-            if ui.down then
-                local f = (ui.my - vp_y - thumb_h / 2) / math.max(1, vp_h - thumb_h)
-                self.scroll_y = math.max(0, math.min(1, f)) * max_scroll
-            else self.sb_drag = false end
-        end
-    else
-        self.sb_drag = false
     end
-    self.scroll_y = math.max(0, math.min(self.scroll_y, max_scroll))
+    return ctrl
+end
 
-    self:_update_tab_spring(globals.frametime())
+local function combo_index(ctrl, items)
+    local v = ctrl:get()
+    if type(v) == "number" then
+        return clamp(v - (COMBO_BASE or 0) + 1, 1, #items)
+    elseif type(v) == "string" then
+        for i = 1, #items do
+            if items[i] == v then return i end
+        end
+    end
+    return 1
+end
 
-    local inner_click = self:_tab_anim_done() and ui.clicked and not self.sb_drag
-        and in_rect(ui.mx, ui.my, x, vp_y, w - 20, vp_h)
+local MODE_ITEMS  = { "Adaptive", "Static side", "Bruteforce" }
+local BASE_ITEMS  = { "Auto", "Eye yaw", "At target" }
+local PITCH_ITEMS = { "Off", "Clamp", "Auto" }
 
-    local cui = {
-        mx = ui.mx, my = ui.my, down = ui.down, released = ui.released,
-        clicked = inner_click,
+local reset_all -- forward declaration (defined in Lifecycle)
+
+do
+    local tab = ui.tab("0x Resolver")
+
+    local g = tab:group("Core")
+    UI.enable  = g:checkbox("Enable resolver", true)
+    UI.apply   = g:checkbox("Override eye angles", true)
+        :tooltip("Writes the resolved angles into m_angEyeAngles every net update.\nRequires Allow Insecure.")
+        :depends(UI.enable)
+    UI.mode    = make_combo(g, "Mode", MODE_ITEMS, MODE_ADAPTIVE):depends(UI.enable)
+    UI.desync  = g:slider_int("Max desync", 0, 90, 58, "%d°"):depends(UI.enable)
+    UI.base    = make_combo(g, "Yaw base", BASE_ITEMS, BASE_AUTO):depends(UI.enable)
+    UI.pitch   = make_combo(g, "Pitch", PITCH_ITEMS, PITCH_AUTO):depends(UI.enable)
+    UI.move_sc = g:slider_int("Moving correction", 0, 100, 35, "%d%%"):depends(UI.enable)
+    UI.jit_sc  = g:slider_int("Jitter correction", 0, 100, 50, "%d%%"):depends(UI.enable)
+
+    local gi = tab:group("Intelligence")
+    UI.body      = gi:checkbox("Body yaw hint", true):tooltip("Estimates lower/upper body yaw from hitbox geometry."):depends(UI.enable)
+    UI.freestand = gi:checkbox("Freestanding hint", true):tooltip("Traces cover left/right of the head; freestanding AA hides toward cover."):depends(UI.enable)
+    UI.move_mem  = gi:checkbox("Movement memory", true):depends(UI.enable)
+    UI.feedback  = gi:checkbox("Hit / miss learning", true):depends(UI.enable)
+    UI.miss_win  = gi:slider_int("Miss window", 150, 1000, 350, "%d ms"):depends(UI.feedback)
+    UI.miss_tol  = gi:slider_int("Misses before step", 1, 3, 1):depends(UI.feedback)
+    UI.persist   = gi:checkbox("Persist learning (db)", true):depends(UI.feedback)
+
+    local gv = tab:group("Visuals")
+    UI.overlay = gv:checkbox("Player overlay", true):depends(UI.enable)
+    UI.debug   = gv:checkbox("Debug panel", false):depends(UI.enable)
+    UI.color   = gv:color("Overlay color", color(235, 235, 235, 255), true):depends(UI.enable)
+
+    local gd = tab:group("Data")
+    UI.stats = gd:label("tracked 0 · hits 0 · misses 0")
+    UI.reset = gd:button("Clear learned data", function()
+        if reset_all then reset_all() end
+    end)
+end
+
+-- Snapshot of UI values, refreshed once per net update / paint.
+local CFG = {}
+local function refresh_config()
+    CFG.enable    = UI.enable:get() == true
+    CFG.apply     = UI.apply:get() == true
+    CFG.mode      = combo_index(UI.mode, MODE_ITEMS)
+    CFG.desync    = UI.desync:get()
+    CFG.base      = combo_index(UI.base, BASE_ITEMS)
+    CFG.pitch     = combo_index(UI.pitch, PITCH_ITEMS)
+    CFG.move_sc   = UI.move_sc:get() / 100
+    CFG.jit_sc    = UI.jit_sc:get() / 100
+    CFG.body      = UI.body:get() == true
+    CFG.freestand = UI.freestand:get() == true
+    CFG.move_mem  = UI.move_mem:get() == true
+    CFG.feedback  = UI.feedback:get() == true
+    CFG.miss_win  = UI.miss_win:get() / 1000
+    CFG.miss_tol  = UI.miss_tol:get()
+    CFG.persist   = UI.persist:get() == true
+    CFG.overlay   = UI.overlay:get() == true
+    CFG.debug     = UI.debug:get() == true
+end
+
+-- ----------------------------------------------------------------------------
+-- State
+-- ----------------------------------------------------------------------------
+local RECORDS = {}   -- key -> record
+local BY_PAWN = {}   -- pawn address -> record
+local PENDING = {}   -- outstanding shots
+local STORE   = {}   -- persisted learning (steamid -> {side, conf, hits, misses, t})
+
+local STATE = {
+    insecure     = false,
+    cmd_angles   = nil,
+    simtime_ok   = true,
+    body_ok      = true,
+    body_good    = 0,
+    body_bad     = 0,
+    last_purge   = 0,
+    last_label   = 0,
+    total_hits   = 0,
+    total_misses = 0,
+    write_cls    = nil,
+    write_ok     = nil,   -- nil unknown, true working, false disabled
+    write_fails  = 0,
+}
+
+-- ----------------------------------------------------------------------------
+-- Records
+-- ----------------------------------------------------------------------------
+local function player_key(ctrl, pawn)
+    if ctrl then
+        local sid = safe(ctrl.steam_id, ctrl)
+        if type(sid) == "string" and sid ~= "" and sid ~= "0" then
+            return sid, true
+        end
+    end
+    return "p" .. tostring(pawn:address()), false
+end
+
+local function new_record(key, is_sid)
+    local rec = {
+        key = key, is_sid = is_sid, name = "?",
+        -- history ring buffers
+        yaws = {}, pitches = {}, deltas = {},
+        head = 0, n = 0, dhead = 0, dn = 0,
+        pitch_jit = 0,
+        -- classification
+        mode = "static", mode_conf = 0, center = 0, amp = 0, spin_rate = 0,
+        -- hints
+        body_delta = 0, fs_hint = 0, mv_hint = 0, score = 0,
+        last_move_yaw = nil, last_move_t = 0, moving = false,
+        -- learning
+        side = 1, conf = 0.3, pred_side = 1, brute_idx = 1,
+        shots = 0, hits = 0, misses = 0, hit_streak = 0, miss_streak = 0,
+        last_hit_t = 0, last_miss_t = 0,
+        -- output
+        at_target = 0, raw_yaw = 0, raw_pitch = 0,
+        resolved_yaw = 0, resolved_pitch = 0, resolved = false, applied = false,
+        -- bookkeeping
+        sim_time = nil, last_tick = -1, seen_rt = 0, pawn = nil, pawn_addr = nil,
     }
+    local saved = (is_sid and CFG.persist) and STORE[key] or nil
+    if type(saved) == "table" then
+        rec.side   = (saved.side == -1) and -1 or 1
+        rec.conf   = clamp((tonumber(saved.conf) or 0) * 0.6, 0, 0.6)
+        rec.hits   = tonumber(saved.hits) or 0
+        rec.misses = tonumber(saved.misses) or 0
+    end
+    return rec
+end
 
-    render.clip_push(x + 1, vp_y, w - 2, vp_h, true)
-    local start = vp_y - self.scroll_y
-    local fin
+local function get_record(ctrl, pawn)
+    local key, is_sid = player_key(ctrl, pawn)
+    local rec = RECORDS[key]
+    if not rec then
+        rec = new_record(key, is_sid)
+        rec.name = (ctrl and safe(ctrl.name, ctrl)) or safe(pawn.name, pawn) or "?"
+        RECORDS[key] = rec
+    end
+    local addr = pawn:address()
+    if rec.pawn_addr ~= addr then
+        if rec.pawn_addr and BY_PAWN[rec.pawn_addr] == rec then BY_PAWN[rec.pawn_addr] = nil end
+        rec.pawn_addr = addr
+        BY_PAWN[addr] = rec
+    end
+    rec.pawn = pawn
+    return rec
+end
 
-    if not self:_tab_anim_done() then
-        local p = self.tab_spring
-        local shift_old = -self.anim_dir * p * vp_h
-        local shift_new = self.anim_dir * (1 - p) * vp_h
-        local dead = { mx = -1, my = -1, down = false, released = false, clicked = false }
+local function record_by_pawn(pawn)
+    if not pawn then return nil end
+    local addr = safe(pawn.address, pawn)
+    return addr and BY_PAWN[addr] or nil
+end
 
-        local old_tab = self.tabs[self.prev_tab_idx]
-        local new_tab = self.tabs[self.current_tab_idx]
-        if old_tab then self:_draw_tab_content(old_tab, dead, gx, start + shift_old, gw, false) end
-        if new_tab then fin = self:_draw_tab_content(new_tab, cui, gx, start + shift_new, gw, true) end
+local function remember(rec)
+    if not rec.is_sid then return end
+    STORE[rec.key] = { side = rec.side, conf = rec.conf, hits = rec.hits, misses = rec.misses, t = os.time() }
+end
+
+-- ----------------------------------------------------------------------------
+-- Persistence
+-- ----------------------------------------------------------------------------
+local function store_load()
+    local data = safe(db.load, META.db, {})
+    STORE = (type(data) == "table") and data or {}
+end
+
+local function store_save()
+    if not CFG.persist then return end
+    -- prune to newest DB_MAX entries
+    local list = {}
+    for k, v in pairs(STORE) do
+        if type(v) == "table" then list[#list + 1] = { k = k, t = tonumber(v.t) or 0 } end
+    end
+    if #list > C.DB_MAX then
+        table.sort(list, function(a, b) return a.t > b.t end)
+        for i = C.DB_MAX + 1, #list do STORE[list[i].k] = nil end
+    end
+    safe(db.save, META.db, STORE)
+end
+
+-- ----------------------------------------------------------------------------
+-- History + classification
+-- ----------------------------------------------------------------------------
+local H = C.HISTORY
+
+local function push_history(rec, yaw, pitch)
+    if rec.n > 0 then
+        local prev_yaw = rec.yaws[rec.head]
+        local prev_pitch = rec.pitches[rec.head]
+        rec.dhead = rec.dhead % H + 1
+        rec.deltas[rec.dhead] = normalize(yaw - prev_yaw)
+        rec.dn = min(H, rec.dn + 1)
+        if abs(pitch - prev_pitch) > 45 then
+            rec.pitch_jit = min(6, rec.pitch_jit + 1)
+        else
+            rec.pitch_jit = max(0, rec.pitch_jit - 0.5)
+        end
+    end
+    rec.head = rec.head % H + 1
+    rec.yaws[rec.head] = yaw
+    rec.pitches[rec.head] = pitch
+    rec.n = min(H, rec.n + 1)
+end
+
+local function circular_mean(rec)
+    local sx, sy = 0, 0
+    for i = 1, rec.n do
+        local a = rad(rec.yaws[i])
+        sx = sx + cos(a)
+        sy = sy + sin(a)
+    end
+    if sx == 0 and sy == 0 then return rec.yaws[rec.head] end
+    return normalize(deg(atan2(sy, sx)))
+end
+
+local function classify(rec)
+    local dn = rec.dn
+    if dn < 3 then
+        rec.mode, rec.mode_conf = "static", 0
+        return
+    end
+
+    local sum_abs, sum_signed, flips, big, prev_sign = 0, 0, 0, 0, 0
+    local idx = (dn == H) and (rec.dhead % H + 1) or 1
+    for _ = 1, dn do
+        local d = rec.deltas[idx]
+        local ad = abs(d)
+        sum_abs = sum_abs + ad
+        sum_signed = sum_signed + d
+        if ad > C.JITTER_MIN_DELTA then
+            big = big + 1
+            local s = (d > 0) and 1 or -1
+            if prev_sign ~= 0 and s ~= prev_sign then flips = flips + 1 end
+            prev_sign = s
+        end
+        idx = idx % H + 1
+    end
+
+    local mean_abs = sum_abs / dn
+    local mean_signed = sum_signed / dn
+    rec.mean_abs = mean_abs
+
+    if abs(mean_signed) > C.SPIN_MIN_RATE and big >= dn * 0.6 and flips <= 1 then
+        rec.mode = "spin"
+        rec.spin_rate = mean_signed
+        rec.mode_conf = min(1, big / dn)
+    elseif big >= dn * 0.4 and flips >= max(2, floor(big * 0.5)) then
+        rec.mode = "jitter"
+        rec.center = circular_mean(rec)
+        local amp = 0
+        for i = 1, rec.n do amp = amp + abs(normalize(rec.yaws[i] - rec.center)) end
+        rec.amp = amp / rec.n
+        rec.mode_conf = min(1, flips / max(1, big - 1))
+    elseif mean_abs < C.STATIC_MAX_DELTA then
+        rec.mode = "static"
+        rec.mode_conf = 1 - mean_abs / C.STATIC_MAX_DELTA
     else
-        local tab = self.tabs[self.current_tab_idx]
-        if tab then fin = self:_draw_tab_content(tab, cui, gx, start, gw, true) end
-    end
-
-    render.clip_pop()
-    self.content_h = ((fin or start) - start) + 4
-
-    if cui.clicked and not self.click_used and not self:_blocked() and max_scroll > 0 then
-        self.ds_drag, self.ds_y0, self.ds_s0 = true, ui.my, self.scroll_y
-    end
-
-    if max_scroll > 0 then
-        local tx = x + w - 10
-        render.rect_filled(tx, vp_y, 3, vp_h, color(255, 255, 255, 10), 2)
-        local ty = vp_y + (vp_h - thumb_h) * (self.scroll_y / max_scroll)
-        render.rect_filled(tx, ty, 3, thumb_h, THEME.accent:alpha(self.sb_drag and 200 or 120), 2)
+        rec.mode = "random"
+        rec.center = circular_mean(rec)
+        rec.mode_conf = 0.5
     end
 end
 
--- ============================================================
---  DROPDOWN OVERLAY
--- ============================================================
-function VibeUI:_draw_dropdown(ui)
-    local d = self.dd
-    if not d.open_id then return end
+-- ----------------------------------------------------------------------------
+-- Hints
+-- ----------------------------------------------------------------------------
+local function hb_kind(h)
+    local g = h.group
+    if g == 4 then return "la" elseif g == 5 then return "ra"
+    elseif g == 6 then return "ll" elseif g == 7 then return "rl" end
+    local n = h.group_name
+    if type(n) == "string" then
+        n = n:lower()
+        local left = n:find("left", 1, true) ~= nil
+        local right = n:find("right", 1, true) ~= nil
+        if n:find("arm", 1, true) then
+            if left then return "la" elseif right then return "ra" end
+        elseif n:find("leg", 1, true) then
+            if left then return "ll" elseif right then return "rl" end
+        end
+    end
+    return nil
+end
 
-    local _, sh = render.screen_size()
-    local target_h = math.min(#d.items * d.item_h, d.max_h)
+-- Returns body yaw from a left/right hitbox pair (highest hitbox of each group).
+local function pair_yaw(hbs, lk, rk)
+    local L, R
+    for i = 1, #hbs do
+        local h = hbs[i]
+        local c = h.center
+        if c then
+            local k = hb_kind(h)
+            if k == lk then
+                if not L or c.z > L.z then L = c end
+            elseif k == rk then
+                if not R or c.z > R.z then R = c end
+            end
+        end
+    end
+    if not L or not R then return nil end
+    local dx, dy = L.x - R.x, L.y - R.y
+    if dx * dx + dy * dy < 4 then return nil end
+    -- (L - R) is the body's left vector => body yaw = atan2(dy, dx) - 90
+    return normalize(deg(atan2(dy, dx)) - 90)
+end
 
-    if ui.clicked and not in_rect(ui.mx, ui.my, d.x, d.y, d.w, target_h) then
-        if not self.click_used and not in_rect(ui.mx, ui.my, d.x, d.y - 26, d.w, 26) then
-            d.open_id = nil
+local function body_hint(rec, pawn, yaw)
+    if not STATE.body_ok then return 0 end
+    local hbs = safe(pawn.hitboxes, pawn)
+    if type(hbs) ~= "table" then
+        STATE.body_bad = STATE.body_bad + 1
+        if STATE.body_bad > 40 then STATE.body_ok = false end
+        return 0
+    end
+    local ref = pair_yaw(hbs, "ll", "rl") or pair_yaw(hbs, "la", "ra")
+    if not ref then return 0 end
+    local d = normalize(ref - yaw)
+    if abs(d) > C.BODY_SANE_DELTA then
+        STATE.body_bad = STATE.body_bad + 1
+        if STATE.body_bad > 40 and STATE.body_good < STATE.body_bad / 8 then
+            STATE.body_ok = false
+            safe(client.notify, "Body yaw hint disabled (hitbox data not usable)", META.name)
+        end
+        return 0
+    end
+    STATE.body_good = STATE.body_good + 1
+    rec.body_delta = d
+    if abs(d) < C.BODY_MIN_DELTA then return 0 end
+    return clamp(d / C.BODY_MAX_DELTA, -1, 1)
+end
+
+-- Freestanding: which side of the enemy head is covered from our point of view.
+-- Derivation: side +1 (CCW) moves the head toward OUR right, so right cover => +1.
+local function freestand_hint(lp, pawn, lp_eye, en_eye)
+    local yaw = rad((en_eye - lp_eye):angles().y)
+    local right = vector(sin(yaw), -cos(yaw), 0)
+    local opts = { skip = { lp, pawn }, mask = MASK_VISIBLE }
+    local tl = safe(trace.line, lp_eye, en_eye - right * C.FS_OFFSET, opts)
+    local tr = safe(trace.line, lp_eye, en_eye + right * C.FS_OFFSET, opts)
+    if type(tl) ~= "table" or type(tr) ~= "table" then return 0 end
+    local fl, fr = tonumber(tl.fraction) or 1, tonumber(tr.fraction) or 1
+    local bl, br = fl < 0.98, fr < 0.98
+    if bl == br then return 0 end
+    return br and 1 or -1
+end
+
+local function movement_hint(rec, yaw, now)
+    if rec.moving or not rec.last_move_yaw then return 0 end
+    local age = now - rec.last_move_t
+    if age < 0 or age > C.MOVE_MEM_TIME then return 0 end
+    local d = normalize(rec.last_move_yaw - yaw)
+    if abs(d) < 20 then return 0 end
+    return sign(d) * (1 - age / C.MOVE_MEM_TIME)
+end
+
+-- ----------------------------------------------------------------------------
+-- Decision + resolution
+-- ----------------------------------------------------------------------------
+local function decide_side(rec, b, fs, mv)
+    rec.fs_hint, rec.mv_hint = fs, mv
+    if CFG.mode == MODE_BRUTE then
+        rec.score = rec.side
+        rec.pred_side = rec.side
+        return
+    end
+    local score = rec.side * rec.conf * C.W_LEARNED
+    if CFG.body then score = score + b * C.W_BODY end
+    if CFG.freestand then score = score + fs * C.W_FREESTAND end
+    if CFG.move_mem then score = score + mv * C.W_MOVE end
+    rec.score = score
+    if abs(score) >= C.SIDE_DEADZONE then
+        rec.pred_side = (score > 0) and 1 or -1
+    end
+end
+
+local function resolve_pitch(rec, pitch)
+    if CFG.pitch == PITCH_OFF then return pitch end
+    if CFG.pitch == PITCH_CLAMP then return clamp(pitch, -89, 89) end
+    -- auto
+    if pitch > 89.5 then return 89 end
+    if pitch < -89.5 then return -89 end
+    if rec.pitch_jit >= 3 then return 89 end -- fake-pitch flicker: assume looking down
+    return clamp(pitch, -89, 89)
+end
+
+local function compute_resolved(rec, yaw, pitch)
+    local mode = rec.mode
+    local desync = CFG.desync
+    local mult = (CFG.mode == MODE_STATIC) and 1 or BRUTE[rec.brute_idx]
+
+    -- base yaw
+    local base
+    if CFG.base == BASE_TARGET then
+        base = rec.at_target
+    elseif CFG.base == BASE_EYE then
+        base = yaw
+    else -- auto
+        if mode == "spin" then
+            base = rec.at_target
+        elseif mode == "jitter" then
+            base = rec.center
+        elseif mode == "random" and rec.mean_abs > C.RANDOM_CENTER_AT then
+            base = rec.center
+        else
+            base = yaw
+        end
+    end
+
+    -- amount
+    local amount = desync * mult
+    if mode == "jitter" then
+        amount = amount * CFG.jit_sc
+    elseif mode == "random" then
+        amount = amount * 0.75
+    end
+    if rec.moving then amount = amount * CFG.move_sc end
+
+    rec.resolved_yaw = normalize(base + rec.pred_side * amount)
+    rec.resolved_pitch = resolve_pitch(rec, pitch)
+    rec.resolved = true
+end
+
+-- ----------------------------------------------------------------------------
+-- Memory write
+-- ----------------------------------------------------------------------------
+local function apply(pawn, rec)
+    rec.applied = false
+    if not CFG.apply or not STATE.insecure or STATE.write_ok == false then return end
+    local ang = vector(rec.resolved_pitch, rec.resolved_yaw, 0)
+
+    if STATE.write_cls then
+        if pcall(pawn.set, pawn, STATE.write_cls, "m_angEyeAngles", "vector", ang) then
+            rec.applied = true
+            STATE.write_fails = 0
+        else
+            STATE.write_fails = STATE.write_fails + 1
+            if STATE.write_fails > 20 then
+                STATE.write_ok = false
+                safe(client.notify, "Eye angle override failing; switched to tracking only", META.name)
+            end
+        end
+        return
+    end
+
+    for i = 1, #EYE_CLASSES do
+        if pcall(pawn.set, pawn, EYE_CLASSES[i], "m_angEyeAngles", "vector", ang) then
+            STATE.write_cls = EYE_CLASSES[i]
+            STATE.write_ok = true
+            rec.applied = true
             return
         end
     end
-
-    d.anim = d.anim + (1 - d.anim) * math.min(1, globals.frametime() * 20)
-    if d.anim > 0.99 then d.anim = 1 end
-    local ease = 1 - (1 - d.anim) ^ 3
-    local h = target_h * ease
-    if h < 1 then return end
-
-    render.shadow(d.x, d.y, d.w, h, black(120), 22, 10)
-    render.rect_filled(d.x, d.y, d.w, h, THEME.card, 6)
-    render.rect(d.x, d.y, d.w, h, THEME.border, 6, 1)
-
-    local max_scroll = math.max(0, #d.items * d.item_h - d.max_h)
-    if in_rect(ui.mx, ui.my, d.x, d.y, d.w, h) then
-        local wh = get_wheel()
-        if wh ~= 0 then
-            d.scroll = math.max(0, math.min(d.scroll - wh * 30, max_scroll))
-        end
-    end
-
-    render.clip_push(d.x, d.y, d.w, h, true)
-    for i, item in ipairs(d.items) do
-        local iy = d.y + (i - 1) * d.item_h - d.scroll
-        if iy + d.item_h > d.y and iy < d.y + h then
-            local hover = in_rect(ui.mx, ui.my, d.x, math.max(d.y, iy), d.w,
-                math.min(h, d.item_h))
-            if hover then
-                render.rect_filled(d.x + 4, iy + 2, d.w - 8, d.item_h - 4,
-                    color(255, 255, 255, 15), 4)
-            end
-            local tw, th = tsize(item)
-            local col = (i - 1 == d.selected_idx) and THEME.accent or THEME.label
-            text(d.x + 12, iy + (d.item_h - th) / 2, col, item)
-            if hover and ui.clicked then
-                self.click_used = true
-                d.setter(i)
-                d.open_id = nil
-            end
-        end
-    end
-    render.clip_pop()
-
-    if max_scroll > 0 then
-        local sb_h = (d.max_h / (#d.items * d.item_h)) * h
-        local sb_y = d.y + (d.scroll / max_scroll) * (h - sb_h)
-        render.rect_filled(d.x + d.w - 6, sb_y, 3, sb_h, color(255, 255, 255, 30), 1.5)
-    end
+    STATE.write_ok = false
+    safe(client.notify, "m_angEyeAngles not found in schema; tracking only", META.name)
 end
 
--- ============================================================
---  COLOR PICKER OVERLAY
--- ============================================================
-local CP_W, CP_H = 250, 276
-
-local function hbar(x, y, w, h, colfn)
-    local r = h / 2
-    for px = 0, w - 1, 2 do
-        local cw = math.min(2, w - px)
-        local dd = math.min(px + 1, w - px - 1)
-        local inset = 0
-        if dd < r then inset = r - math.sqrt(math.max(0, r * r - (r - dd) * (r - dd))) end
-        render.rect_filled(x + px, y + inset, cw, h - inset * 2, colfn((px + 1) / w))
-    end
+-- ----------------------------------------------------------------------------
+-- Per-player update
+-- ----------------------------------------------------------------------------
+local function read_simtime(pawn)
+    if not STATE.simtime_ok then return nil end
+    local ok, v = pcall(pawn.get, pawn, "C_BaseEntity", "m_flSimulationTime", "float")
+    if ok and type(v) == "number" then return v end
+    STATE.simtime_ok = false
+    return nil
 end
 
-local function sv_area(x, y, w, h, r, hue_col, k)
-    for py = 0, h - 1, 2 do
-        local rh = math.min(2, h - py)
-        local dd = math.min(py + 1, h - py - 1)
-        local inset = 0
-        if dd < r then inset = r - math.sqrt(math.max(0, r * r - (r - dd) * (r - dd))) end
-        local v = 1 - (py + rh / 2) / h
-        local left = color(255 * v, 255 * v, 255 * v, 255 * k)
-        local right = color(hue_col.r * v, hue_col.g * v, hue_col.b * v, 255 * k)
-        render.gradient(x + inset, y + py, w - inset * 2, rh, left, right, true)
-    end
-end
+local function process(pawn, ctrl, lp, lp_alive, lp_eye, now, tick, rt)
+    local rec = get_record(ctrl, pawn)
+    rec.seen_rt = rt
 
-function VibeUI:_draw_colorpicker(ui)
-    local c = self.cp
-    local k = 1 - (1 - c.anim) ^ 3
-    if k <= 0.01 then return end
-    local function A(col) return col:alpha(col.a * k) end
+    local eye = pawn:eye_angles()
+    local yaw = normalize(eye.y)
+    local pitch = eye.x
 
-    local sw, sh = render.screen_size()
-    local px = self.x + self.w + 12
-    if px + CP_W > sw - 8 then px = self.x + (self.w - CP_W) / 2 end
-    px = math.max(8, math.min(px, sw - CP_W - 8))
-    local py = math.max(8, math.min(self.y, sh - CP_H - 8))
-    px = px - (1 - k) * 14
-    py = py + (1 - k) * 10
-
-    if c.open then
-        if c.skip_close then c.skip_close = false
-        elseif ui.clicked and not in_rect(ui.mx, ui.my, px, py, CP_W, CP_H) then
-            c.open = false; c.drag = nil; c.dd_open = false
-        end
-    end
-
-    local pad = 12
-    local iw = CP_W - pad * 2
-    local svx, svy, svh = px + pad, py + pad, 170
-    local hy = svy + svh + 14
-    local ay = hy + 8 + 12
-    local ry = ay + 8 + 16
-
-    render.shadow(px, py, CP_W, CP_H, black(110 * k), 22, 12)
-    render.rect_filled(px, py, CP_W, CP_H, A(THEME.bg), 12)
-    render.rect(px, py, CP_W, CP_H, A(THEME.border), 12, 1)
-
-    local hue_col = color_hsv(c.h, 1, 1, 255)
-    local cur = color_hsv(c.h, c.s, c.v, 255)
-
-    sv_area(svx, svy, iw, svh, 8, hue_col, k)
-    render.rect(svx, svy, iw, svh, A(white(22)), 8, 1)
-    hbar(svx, hy + 1, iw, 8, function(f) return color_hsv(f, 1, 1, 255 * k) end)
-    render.rect_filled(svx, ay + 1, iw, 8, A(THEME.sw_off), 4)
-    hbar(svx, ay + 1, iw, 8, function(f) return color(cur.r, cur.g, cur.b, 255 * f * k) end)
-
-    local kx, ky = svx + c.s * iw, svy + (1 - c.v) * svh
-    render.circle_filled(kx, ky, 8, A(white(255)), 24)
-    render.circle_filled(kx, ky, 6, A(cur), 24)
-
-    local hx = svx + c.h * iw
-    render.rect_filled(hx - 5, hy - 4, 10, 18, A(white(255)), 5)
-    render.rect_filled(hx - 3, hy - 2, 6, 14, A(hue_col), 3)
-
-    local ax = svx + c.a * iw
-    render.circle_filled(ax, ay + 5, 8, A(white(255)), 24)
-    render.circle_filled(ax, ay + 5, 6, A(cur), 24)
-
-    local fw, vw, ow, rh = 60, 110, 44, 26
-    local fx = svx
-    local vx = fx + fw + 6
-    local ox = vx + vw + 6
-    local cc = color_hsv(c.h, c.s, c.v, math.floor(c.a * 255 + 0.5))
-
-    local function field(x, w_)
-        render.rect_filled(x, ry, w_, rh, A(THEME.field), 7)
-        render.rect(x, ry, w_, rh, A(THEME.border), 7, 1)
-    end
-    local function ftext(x, w_, col, str)
-        local tw, th = tsize(str)
-        text(x + (w_ - tw) / 2, ry + (rh - th) / 2, A(col), str)
-    end
-
-    field(fx, fw)
-    local fstr = (c.fmt == 0) and "HEX" or "RGB"
-    text(fx + 6, ry + (rh - text_h()) / 2, A(THEME.label), fstr)
-
-    local arrow_t = 1 - 2 * (c.dd_anim or 0)
-    local ccx, ccy = fx + fw - 12, ry + rh / 2
-    render.line(ccx - 4, ccy - 2 * arrow_t, ccx, ccy + 2 * arrow_t, A(THEME.value), 1.5)
-    render.line(ccx, ccy + 2 * arrow_t, ccx + 4, ccy - 2 * arrow_t, A(THEME.value), 1.5)
-
-    field(vx, vw)
-    render.rect_filled(vx + 7, ry + (rh - 14) / 2, 14, 14, A(color(cc.r, cc.g, cc.b, 255)), 4)
-    local tx0, tw0 = vx + 26, vw - 26
-    if c.fmt == 0 then
-        local hexs = cc:hex():upper()
-        local hw_ = tsize("#")
-        local tw_, th_ = tsize(hexs)
-        local startx = tx0 + (tw0 - (hw_ + 2 + tw_)) / 2
-        text(startx, ry + (rh - th_) / 2, A(THEME.section), "#")
-        text(startx + hw_ + 2, ry + (rh - th_) / 2, A(THEME.label), hexs)
+    -- Freshness gate: only analyse genuinely new network data.
+    local simt = read_simtime(pawn)
+    local fresh
+    if simt then
+        fresh = (simt ~= rec.sim_time)
+        rec.sim_time = simt
     else
-        ftext(tx0, tw0, THEME.label, string.format("%d,%d,%d",
-            math.floor(cc.r + 0.5), math.floor(cc.g + 0.5), math.floor(cc.b + 0.5)))
-    end
-
-    field(ox, ow)
-    ftext(ox, ow, THEME.label, string.format("%d%%", math.floor(c.a * 100 + 0.5)))
-
-    local fmt_items = { "HEX", "RGB" }
-    local drop_h = #fmt_items * 26
-    local drop_y = ry + rh + 4
-    c.dd_anim = c.dd_anim + ((c.dd_open and 1 or 0) - c.dd_anim) * math.min(1, globals.frametime() * 20)
-    if c.dd_anim > 0.01 then
-        local dh = drop_h * c.dd_anim
-        render.shadow(fx, drop_y, fw, dh, A(black(100)), 6, 4)
-        render.rect_filled(fx, drop_y, fw, dh, A(THEME.card), 6)
-        render.rect(fx, drop_y, fw, dh, A(THEME.border), 6, 1)
-        render.clip_push(fx, drop_y, fw, dh, true)
-        for i, fmt_str in ipairs(fmt_items) do
-            local iy = drop_y + (i - 1) * 26
-            local ihover = in_rect(ui.mx, ui.my, fx, iy, fw, 26) and c.dd_anim > 0.95
-            if ihover then
-                render.rect_filled(fx + 2, iy + 2, fw - 4, 22, A(white(15)), 4)
-            end
-            local tw = tsize(fmt_str)
-            text(fx + (fw - tw) / 2, iy + (26 - text_h()) / 2, A(THEME.label), fmt_str)
-            if ihover and ui.clicked then
-                c.fmt = i - 1
-                c.dd_open = false
-            end
-        end
-        render.clip_pop()
-    end
-
-    if c.open then
-        if ui.released then c.drag = nil end
-        if ui.clicked and in_rect(ui.mx, ui.my, fx, ry, fw, rh) then
-            c.dd_open = not c.dd_open
-            c.skip_close = true
-        end
-        if c.dd_open and ui.clicked
-            and not in_rect(ui.mx, ui.my, fx, ry, fw, rh + drop_h) then
-            c.dd_open = false
-        end
-        if not c.dd_open and ui.down then
-            if c.drag == "sv" or (ui.clicked and in_rect(ui.mx, ui.my, svx, svy, iw, svh)) then
-                c.drag = "sv"
-                c.s = math.max(0, math.min(1, (ui.mx - svx) / iw))
-                c.v = math.max(0, math.min(1, 1 - (ui.my - svy) / svh))
-            elseif c.drag == "hue" or (ui.clicked and in_rect(ui.mx, ui.my, svx - 6, hy - 6, iw + 12, 22)) then
-                c.drag = "hue"
-                c.h = math.max(0, math.min(1, (ui.mx - svx) / iw))
-            elseif c.drag == "alpha" or (ui.clicked and in_rect(ui.mx, ui.my, svx - 6, ay - 6, iw + 12, 22)) then
-                c.drag = "alpha"
-                c.a = math.max(0, math.min(1, (ui.mx - svx) / iw))
-            end
-        end
-
-        -- Write back into target widget
-        local w = c.target
-        if w then
-            local new_col = color_hsv(c.h, c.s, c.v, math.floor(c.a * 255 + 0.5))
-            local old = w.value
-            if not old or old.r ~= new_col.r or old.g ~= new_col.g
-                or old.b ~= new_col.b or old.a ~= new_col.a then
-                w._h, w._s, w._v = c.h, c.s, c.v
-                w._a = c.a
-                w.value = new_col
-                if w.on_change then pcall(w.on_change, new_col) end
-            end
+        fresh = (tick ~= rec.last_tick)
+        -- Echo guard: without simulation time we could read back our own write.
+        if fresh and rec.applied
+            and abs(normalize(yaw - rec.resolved_yaw)) < 0.01
+            and abs(pitch - rec.resolved_pitch) < 0.01 then
+            fresh = false
         end
     end
-end
+    rec.last_tick = tick
 
--- ============================================================
---  FULL PAINT PASSES
--- ============================================================
-function VibeUI:_paint_main(ui)
-    if self.follow_ui then
-        self.dock_anim = self.dock_anim + (1 - self.dock_anim) * math.min(1, globals.frametime() * 14)
-        if self.dock_anim > 0.995 then self.dock_anim = 1 end
+    if not fresh then
+        if rec.resolved then apply(pawn, rec) end
+        return
+    end
+
+    local vel = pawn:velocity()
+    local speed = vel:length2d()
+
+    rec.raw_yaw, rec.raw_pitch = yaw, pitch
+    push_history(rec, yaw, pitch)
+    classify(rec)
+
+    if speed > C.MOVE_SPEED then
+        rec.moving = true
+        rec.last_move_yaw = normalize(vel:angles().y)
+        rec.last_move_t = now
     else
-        self.dock_anim = 1
+        rec.moving = false
     end
 
-    self:_update_geometry()
-    self:_draw_tabs(ui, self.x + self.w + 12, self.y)
+    local en_eye = pawn:eye_position()
+    rec.at_target = normalize(calc_angle(en_eye, lp_eye).y)
 
-    render.shadow(self.x, self.y, self.w, self.h, black(120), 22, 12)
-    render.rect_filled(self.x, self.y, self.w, self.h, THEME.bg, 12)
-    render.rect(self.x, self.y, self.w, self.h, THEME.border, 12, 1)
+    local b  = CFG.body and body_hint(rec, pawn, yaw) or 0
+    local fs = (CFG.freestand and lp_alive) and freestand_hint(lp, pawn, lp_eye, en_eye) or 0
+    local mv = CFG.move_mem and movement_hint(rec, yaw, now) or 0
 
-    self:_draw_controls(ui, self.x, self.y, self.w)
-    self:_draw_header(self.x, self.y + self.h - THEME.header_h, self.w)
-
-    self.click_used = self.click_used or false
+    decide_side(rec, b, fs, mv)
+    compute_resolved(rec, yaw, pitch)
+    apply(pawn, rec)
 end
 
-function VibeUI:_paint_overlays(ui)
-    self:_draw_dropdown(ui)
-    local c = self.cp
-    c.anim = c.anim + ((c.open and 1 or 0) - c.anim) * math.min(1, globals.frametime() * 16)
-    if c.open and c.anim > 0.995 then c.anim = 1 end
-    if not c.open and c.anim < 0.01 then c.anim = 0 end
-    self:_draw_colorpicker(ui)
+-- ----------------------------------------------------------------------------
+-- Shot feedback
+-- ----------------------------------------------------------------------------
+local function on_hit(rec, hitgroup)
+    for i = #PENDING, 1, -1 do
+        if PENDING[i].key == rec.key then tremove(PENDING, i) end
+    end
+    rec.hits = rec.hits + 1
+    rec.hit_streak = rec.hit_streak + 1
+    rec.miss_streak = 0
+    rec.last_hit_t = globals.curtime()
+    STATE.total_hits = STATE.total_hits + 1
+
+    local m = (CFG.mode == MODE_STATIC) and 1 or BRUTE[rec.brute_idx]
+    if m ~= 0 then
+        rec.side = sign(rec.pred_side * m)
+        if abs(m) == 1 then rec.brute_idx = 1 end
+    end
+    rec.conf = min(1, rec.conf + C.HIT_CONF_GAIN * (hitgroup == 1 and 1.25 or 1))
+    remember(rec)
 end
 
--- ============================================================
---  GLOBAL DISPATCHER
--- ============================================================
-events.on("paint", function()
-    refresh_accent()
-    local mx, my = input.cursor()
-    local down = input.key_down(0x01)
-    local clicked = down and not mouse_prev_global
-    local released = mouse_prev_global and not down
+local function on_miss(shot, rec)
+    rec.misses = rec.misses + 1
+    rec.hit_streak = 0
+    rec.last_miss_t = globals.curtime()
+    STATE.total_misses = STATE.total_misses + 1
+    rec.conf = max(0, rec.conf - C.MISS_CONF_LOSS)
+    if shot.moving then
+        -- moving targets miss for many reasons; do not step the brute table
+        remember(rec)
+        return
+    end
+    rec.miss_streak = rec.miss_streak + 1
+    if rec.miss_streak >= CFG.miss_tol then
+        rec.miss_streak = 0
+        if CFG.mode ~= MODE_STATIC then
+            rec.brute_idx = rec.brute_idx % BRUTE_N + 1
+        else
+            rec.side = -rec.side
+        end
+    end
+    remember(rec)
+end
 
-    -- pass 1: main panels
-    for _, m in ipairs(REGISTERED) do
-        if m:is_visible() then
-            local ui = { mx = mx, my = my, down = down, clicked = clicked, released = released }
-            -- suppress click inside an active dropdown to avoid double-handling
-            if m.dd.open_id and clicked then
-                local th = math.min(#m.dd.items * m.dd.item_h, m.dd.max_h)
-                if in_rect(mx, my, m.dd.x, m.dd.y, m.dd.w, th) then
-                    ui.clicked = false
+local function check_pending(now)
+    for i = #PENDING, 1, -1 do
+        local s = PENDING[i]
+        if now - s.t > CFG.miss_win then
+            tremove(PENDING, i)
+            local rec = RECORDS[s.key]
+            if rec then on_miss(s, rec) end
+        elseif now < s.t then
+            tremove(PENDING, i) -- clock went backwards (map change)
+        end
+    end
+end
+
+local function find_shot_target(lp)
+    local from = lp:eye_position()
+    local angs = { safe(engine.view_angles), STATE.cmd_angles }
+    for i = 1, 2 do
+        local a = angs[i]
+        if a then
+            local r = safe(trace.bullet, from, from + a:forward() * 8192)
+            if type(r) == "table" and r.hit and r.entity then
+                local rec = record_by_pawn(r.entity)
+                if rec then return rec end
+            end
+        end
+    end
+    -- fallback: closest tracked enemy to the crosshair within 12 degrees
+    local va = angs[1]
+    if not va then return nil end
+    local best, best_fov = nil, 12
+    local rt = globals.realtime()
+    for _, rec in pairs(RECORDS) do
+        if rec.pawn and rt - rec.seen_rt < 0.2 then
+            local ep = safe(rec.pawn.eye_position, rec.pawn)
+            if ep then
+                local want = calc_angle(from, ep)
+                local dy = abs(normalize(want.y - va.y))
+                local dp = abs(want.x - va.x)
+                local fov = sqrt(dy * dy + dp * dp)
+                if fov < best_fov then best, best_fov = rec, fov end
+            end
+        end
+    end
+    return best
+end
+
+local function is_local_controller(ctrl)
+    if not ctrl then return false end
+    local lc = entity.local_controller()
+    if not lc then return false end
+    return ctrl:address() == lc:address()
+end
+
+local function on_weapon_fire(ev)
+    if not CFG.enable or not CFG.feedback then return end
+    local ctrl = safe(ev.get_controller, ev, "userid")
+    if not is_local_controller(ctrl) then return end
+    local lp = entity.local_pawn()
+    if not lp then return end
+    local info = safe(lp.weapon_info, lp)
+    if type(info) == "table" and info.gun == false then return end
+
+    local rec = find_shot_target(lp)
+    if not rec then return end
+    rec.shots = rec.shots + 1
+    PENDING[#PENDING + 1] = {
+        key = rec.key, t = globals.curtime(),
+        side = rec.pred_side, idx = rec.brute_idx, mode = rec.mode, moving = rec.moving,
+    }
+    if #PENDING > C.PENDING_MAX then tremove(PENDING, 1) end
+end
+
+local function on_player_hurt(ev)
+    if not CFG.enable or not CFG.feedback then return end
+    local att = safe(ev.get_controller, ev, "attacker")
+    if not is_local_controller(att) then return end
+
+    local rec = record_by_pawn(safe(ev.get_pawn, ev, "userid"))
+    if not rec then
+        local vc = safe(ev.get_controller, ev, "userid")
+        if vc then
+            local sid = safe(vc.steam_id, vc)
+            if sid then rec = RECORDS[sid] end
+            if not rec then rec = record_by_pawn(safe(vc.pawn, vc)) end
+        end
+    end
+    if not rec then return end
+    on_hit(rec, safe(ev.get_int, ev, "hitgroup") or 0)
+end
+
+-- ----------------------------------------------------------------------------
+-- Frame stage
+-- ----------------------------------------------------------------------------
+local function reapply_all()
+    local players = safe(entity.players)
+    if type(players) ~= "table" then return end
+    for i = 1, #players do
+        local pawn = players[i].pawn
+        if pawn then
+            local rec = BY_PAWN[pawn:address()]
+            if rec and rec.resolved and safe(pawn.alive, pawn) then apply(pawn, rec) end
+        end
+    end
+end
+
+local function purge(rt)
+    if rt - STATE.last_purge < 5 then return end
+    STATE.last_purge = rt
+    for key, rec in pairs(RECORDS) do
+        if rt - rec.seen_rt > C.PURGE_AFTER then
+            if rec.pawn_addr and BY_PAWN[rec.pawn_addr] == rec then BY_PAWN[rec.pawn_addr] = nil end
+            RECORDS[key] = nil
+        end
+    end
+end
+
+local function on_frame_stage(st)
+    if st ~= STAGE_NET_END and st ~= STAGE_LAGCOMP then return end
+    refresh_config()
+    if not CFG.enable or not engine.in_game() then return end
+    STATE.insecure = safe(client.insecure) == true
+
+    if st == STAGE_LAGCOMP then
+        reapply_all()
+        return
+    end
+
+    local lp = entity.local_pawn()
+    if not lp then return end
+    local lp_alive = safe(lp.alive, lp) == true
+    local lp_eye = safe(lp.eye_position, lp)
+    if not lp_eye then return end
+
+    local now, tick, rt = globals.curtime(), globals.tickcount(), globals.realtime()
+    local players = entity.players()
+    for i = 1, #players do
+        local p = players[i]
+        local pawn = p.pawn
+        if pawn and pawn:alive() and pawn:is_enemy() then
+            local ok, err = pcall(process, pawn, p.controller, lp, lp_alive, lp_eye, now, tick, rt)
+            if not ok and CFG.debug then print("[0x] process error: " .. tostring(err)) end
+        end
+    end
+
+    if CFG.feedback then check_pending(now) end
+    purge(rt)
+end
+
+-- ----------------------------------------------------------------------------
+-- Createmove: capture the angles actually sent (silent aim aware)
+-- ----------------------------------------------------------------------------
+local function on_createmove(cmd)
+    local a = safe(cmd.view_angles, cmd)
+    if a then STATE.cmd_angles = vector(a.x, a.y, 0) end
+end
+
+-- ----------------------------------------------------------------------------
+-- Paint
+-- ----------------------------------------------------------------------------
+local function side_label(rec)
+    return (rec.pred_side > 0) and "L" or "R"
+end
+
+local function on_paint()
+    refresh_config()
+
+    -- stats label (1 Hz)
+    local rt = globals.realtime()
+    if rt - STATE.last_label > 1 then
+        STATE.last_label = rt
+        local tracked = 0
+        for _, rec in pairs(RECORDS) do
+            if rt - rec.seen_rt < 1 then tracked = tracked + 1 end
+        end
+        safe(UI.stats.set, UI.stats, format("tracked %d · hits %d · misses %d · write %s",
+            tracked, STATE.total_hits, STATE.total_misses,
+            STATE.write_ok == true and "on" or (STATE.write_ok == false and "off" or "n/a")))
+    end
+
+    if not CFG.enable or not engine.in_game() then return end
+    local col = UI.color:get()
+    if type(col) ~= "table" then col = color(235, 235, 235, 255) end
+    local dim = col:alpha(floor(col.a * 0.6))
+
+    if CFG.overlay then
+        for _, rec in pairs(RECORDS) do
+            if rec.pawn and rec.resolved and rt - rec.seen_rt < 0.1 then
+                local l, t, r = safe(rec.pawn.bbox, rec.pawn)
+                if l and t and r then
+                    local dlt = normalize(rec.resolved_yaw - rec.raw_yaw)
+                    local txt = format("%s %s %d°  %d/%d", MODE_LABEL[rec.mode] or "?", side_label(rec), floor(abs(dlt) + 0.5), rec.hits, rec.misses)
+                    local w = render.text_size(txt)
+                    local x = (l + r) * 0.5 - w * 0.5
+                    render.text(x, t - 16, rec.applied and col or dim, txt)
                 end
             end
-            m:_paint_main(ui)
         end
     end
 
-    -- pass 2: overlays on top of every panel
-    for _, m in ipairs(REGISTERED) do
-        if m:is_visible() then
-            local ui = { mx = mx, my = my, down = down, clicked = clicked, released = released }
-            m:_paint_overlays(ui)
+    if CFG.debug then
+        local x, y = 24, 120
+        local rows = {}
+        rows[#rows + 1] = format("%s v%s  insecure=%s write=%s simtime=%s body=%s pending=%d",
+            META.name, META.version,
+            tostring(STATE.insecure),
+            tostring(STATE.write_ok), tostring(STATE.simtime_ok), tostring(STATE.body_ok), #PENDING)
+        for _, rec in pairs(RECORDS) do
+            if rt - rec.seen_rt < 1 then
+                rows[#rows + 1] = format(
+                    "%-14s %-6s side=%s conf=%.2f score=%+.2f brute=%d(%+.2f) body=%+d fs=%+d mv=%+.1f res=%d raw=%d h/m=%d/%d%s",
+                    tostring(rec.name):sub(1, 14), MODE_LABEL[rec.mode] or "?", side_label(rec), rec.conf, rec.score,
+                    rec.brute_idx, BRUTE[rec.brute_idx], floor(rec.body_delta + 0.5), rec.fs_hint, rec.mv_hint,
+                    floor(rec.resolved_yaw + 0.5), floor(rec.raw_yaw + 0.5), rec.hits, rec.misses,
+                    rec.applied and "" or " [track]")
+            end
+        end
+        local wmax = 0
+        for i = 1, #rows do
+            local w = render.text_size(rows[i])
+            if w > wmax then wmax = w end
+        end
+        render.rect_filled(x - 8, y - 6, wmax + 16, #rows * 15 + 12, color(12, 12, 14, 200), 4)
+        for i = 1, #rows do
+            render.text(x, y + (i - 1) * 15, i == 1 and col or dim, rows[i])
         end
     end
+end
 
-    mouse_prev_global = down
+-- ----------------------------------------------------------------------------
+-- Lifecycle
+-- ----------------------------------------------------------------------------
+local function reset_volatile()
+    PENDING = {}
+    for _, rec in pairs(RECORDS) do
+        rec.n, rec.dn, rec.head, rec.dhead = 0, 0, 0, 0
+        rec.pitch_jit = 0
+        rec.mode, rec.mode_conf = "static", 0
+        rec.resolved = false
+        rec.sim_time = nil
+        rec.last_move_yaw = nil
+        rec.conf = rec.conf * C.ROUND_CONF_DECAY
+    end
+end
+
+reset_all = function()
+    RECORDS, BY_PAWN, PENDING, STORE = {}, {}, {}, {}
+    STATE.total_hits, STATE.total_misses = 0, 0
+    safe(db.save, META.db, {})
+    safe(client.notify, "Learned data cleared", META.name)
+end
+
+local function on_round_start()
+    reset_volatile()
+    store_save()
+end
+
+local function on_level_init()
+    RECORDS, BY_PAWN, PENDING = {}, {}, {}
+    STATE.body_good, STATE.body_bad, STATE.body_ok = 0, 0, true
+    STATE.simtime_ok = true
+    STATE.write_fails = 0
+    if STATE.write_ok == false then STATE.write_ok, STATE.write_cls = nil, nil end
+end
+
+local function on_level_shutdown()
+    store_save()
+    RECORDS, BY_PAWN, PENDING = {}, {}, {}
+end
+
+-- ----------------------------------------------------------------------------
+-- Wiring
+-- ----------------------------------------------------------------------------
+local EVENTS = {}
+local function hook(name, fn)
+    EVENTS[#EVENTS + 1] = events.on(name, function(...)
+        local ok, err = pcall(fn, ...)
+        if not ok then print("[0x] " .. name .. ": " .. tostring(err)) end
+    end)
+end
+
+refresh_config()
+store_load()
+STATE.insecure = safe(client.insecure) == true
+
+hook("frame_stage",     on_frame_stage)
+hook("createmove",      on_createmove)
+hook("paint",           on_paint)
+hook("weapon_fire",     on_weapon_fire)
+hook("player_hurt",     on_player_hurt)
+hook("round_start",     on_round_start)
+hook("level_init",      on_level_init)
+hook("level_shutdown",  on_level_shutdown)
+
+events.on("unload", function()
+    safe(store_save)
+    for i = 1, #EVENTS do safe(events.off, EVENTS[i]) end
 end)
 
--- ============================================================
---  USAGE EXAMPLE  (delete or comment if not needed)
--- ============================================================
-local menu = VibeUI.new({ title = "Menu", subtitle = "VibeUI " .. VibeUI.__version })
-
-local tab_v = menu:tab("Visual")
-local tab_s = menu:tab("Settings")
-
-tab_v:section("DROPDOWNS")
-tab_v:combo("combo1", "Test", { "Option 1", "Option 2", "Option 3", "Option 4" }, 1)
-
-tab_v:section("CHECKBOXES")
-tab_v:checkbox("cb_a", "Test Toggle 1", true)
-tab_v:checkbox("cb_b", "Test Toggle 2", false)
-
-tab_v:section("SLIDERS")
-tab_v:slider("sl_int",   "Test Slider 1", 50,  0,   100, 1,
-    function(v) return tostring(math.floor(v + 0.5)) end)
-tab_v:slider("sl_float", "Test Slider 2", 1.5, 0.1, 5.0, 0.1,
-    function(v) return string.format("%.1f", v) end)
-
-tab_s:section("COLORS")
-tab_s:colorpicker("c1", "Accent color",    color(140, 148, 255, 255))
-tab_s:colorpicker("c2", "Secondary color", color(110, 200, 255, 200))
-tab_s:colorpicker("c3", "Highlight color", color(255, 235, 65, 255))
-
-tab_s:section("ACTIONS")
-tab_s:button("reset", "Reset settings", function()
-    tab_v:set("cb_a", true)
-    tab_v:set("cb_b", false)
-    tab_v:set("sl_int", 50)
-    tab_v:set("sl_float", 1.5)
-    tab_v:set("combo1", 1)
-    client.notify("Settings reset", "VibeUI")
-end)
-
-menu:register()
-client.notify("VibeUI " .. VibeUI.__version .. " loaded", "VibeCord")
+print(format("[%s] v%s loaded · insecure=%s", META.name, META.version, tostring(STATE.insecure)))
